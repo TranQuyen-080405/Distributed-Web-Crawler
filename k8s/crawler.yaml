@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crawler
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: crawler
+  template:
+    metadata:
+      labels:
+        app: crawler
+    spec:
+      containers:
+        - name: crawler
+          image: distributed-web-crawler:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "crawler.main"]
+          env:
+            - name: KAFKA_BOOTSTRAP
+              value: kafka:9092
+            - name: DATABASE_URL
+              value: postgresql://crawler:crawler@postgres:5432/crawler
