@@ -2,10 +2,35 @@
 
 
 \subsection{Background and motivation}
+% Why crawling at scale needs more than one machine (see Section 2.1, "Why distribute?").
+
+
+% ==================================================================
+
+
 \subsection{Problem statement}
+% State the problem: a single crawler is limited; the goal is a Kafka-based distributed crawler on Kubernetes.
+
+
+% ==================================================================
+
+
 \subsection{Objectives}
+% Objectives (from the "Tieu chi" sheet): correctness, distribution, scalability, fault tolerance, performance, reproducibility.
+
+
+% ==================================================================
+
+
 \subsection{Scope and limitations}
+% Scope: core = Phases 1--3 (baseline, distributed crawler, scaling/fault tolerance/evaluation).
+
+
+% ==================================================================
+
+
 \subsection{Report structure}
+% Report structure: write as one short closing paragraph instead of a separate subsection.
 
 
 
@@ -74,82 +99,68 @@ These questions are the focus of this project.
 
 \subsection{Concepts and Knowledge from the course}
 
-
-This section presents the distributed-systems concepts from the course that are needed to design and evaluate the distributed crawler.
-
-
-\subsubsection{Distributed System Model}
-A distributed system consists of independent nodes that communicate only by passing messages over a network, with no shared memory and no shared clock. The network may delay or drop messages, and nodes may crash. In this project, the nodes are a coordinator and several crawler workers, and the failure model considered is the crash failure of a worker (and, as an extension, of the coordinator).
+This section presents the distributed-systems concepts from the course that are needed to design and evaluate the distributed crawler. Table~\ref{tab:concepts} at the end of the section relates them to the problems of the crawler.
 
 
-\subsubsection{Coordinator--Worker Architecture}
-In a coordinator--worker (master--slave) architecture, one node manages the global state and distributes tasks, while the other nodes execute them. This design is simple and makes global decisions, such as duplicate detection, easy. Its main drawbacks are that the coordinator is a potential \textbf{single point of failure} and a possible \textbf{performance bottleneck}.
+\subsubsection{Architecture and Communication}
+A distributed system consists of independent nodes that communicate only by passing messages over a network, with no shared memory and no shared clock. The network may delay or drop messages, and nodes may crash. In this project, the nodes are a \textbf{scheduler}, several \textbf{crawler workers}, a \textbf{message broker} (Apache Kafka), and a \textbf{database} (PostgreSQL). The failure model considered is the crash of a worker; the failure of a broker or of the scheduler is treated as an extension.
+
+Instead of a direct request--response style (RPC or REST) between a coordinator and its workers, the system uses the \textbf{producer--consumer} pattern over a message queue, as covered in the data-streaming part of the course. The scheduler \emph{produces} crawl tasks into a Kafka topic and the workers \emph{consume} them; the workers in turn produce newly discovered URLs into another topic that the scheduler consumes. The broker decouples the components: they do not need to know each other's address, and workers can be added or removed without changing the scheduler. Kafka stores messages in \textbf{topics}, each split into \textbf{partitions}, and consumers that share a \textbf{consumer group} divide the partitions among themselves. The workers run as containers (pods) managed by Kubernetes.
 
 
-\subsubsection{Distributed Communication}
-The coordinator and the workers communicate with a request--response pattern. In this project, HTTP with the REST style and JSON messages is used: a worker asks the coordinator for a task, downloads the page, and then submits the result and the newly discovered URLs. This corresponds to the client--server model and the remote invocation techniques (RPC and REST APIs) covered in the course.
+\subsubsection{Task Distribution and Concurrency}
+With \textbf{static allocation}, each worker receives a fixed set of URLs in advance, so fast workers may sit idle while slow ones are still busy. With \textbf{dynamic allocation}, a worker takes a new task whenever it becomes free, which balances the load automatically. A Kafka consumer group behaves like dynamic allocation at the granularity of partitions: each partition is read by exactly one consumer of the group, so the number of useful workers is bounded by the number of partitions. Messages are keyed by domain, so that all URLs of one domain are handled by the same worker, which keeps per-domain politeness (rate limiting) simple.
+
+If two workers discover the same URL at almost the same time, both report it to the scheduler. Checking whether a URL is known and registering it must therefore be a single \textbf{atomic} operation; otherwise a \textbf{race condition} may create the same task twice. In this project the scheduler is the only component that decides whether a URL is new, and it relies on the atomicity of a database operation (a unique constraint on the URL in PostgreSQL) instead of application-level locks.
 
 
-\subsubsection{Task Allocation and Load Balancing}
-With \textbf{static allocation}, each worker receives a fixed number of URLs in advance. Because websites respond at different speeds, some workers finish early and sit idle while others are still busy. With \textbf{dynamic allocation}, a worker requests a new task whenever it becomes free, which balances the load automatically. Both strategies are compared in the experiments.
+\subsubsection{Fault Tolerance and Consistency}
+Failures of workers are detected through the consumer-group heartbeat and session timeout of Kafka: when a worker stops responding, its partitions are reassigned to the remaining workers. Kubernetes additionally restarts a failed pod. Because a worker commits its position in the topic only after it has processed a task, a task that was in progress when the worker crashed is delivered again. The system therefore provides \textbf{at-least-once} delivery. Since a task may be processed twice, storing results must be \textbf{idempotent}: processing the same result twice must not create duplicate records. Failed tasks can additionally be retried and, after too many failures, moved to a dead-letter queue.
 
-
-\subsubsection{Concurrency and Coordination}
-If two workers discover the same URL at almost the same time, the coordinator may receive both reports concurrently. Checking whether a URL exists and inserting it into the queue must therefore be a single \textbf{atomic} operation; otherwise a \textbf{race condition} may put the same URL into the queue twice. In a multithreaded coordinator this requires a mutex or an equivalent synchronization mechanism.
-
-
-\subsubsection{Fault Tolerance}
-Failures are detected with \textbf{heartbeats} and \textbf{timeouts}. Each task assigned to a worker has a \textbf{lease}: if the worker does not report completion before the lease expires, the coordinator considers the worker failed and returns the task to the queue so that another worker can process it.
-
-Because a worker may finish a task and crash before its report arrives, the same task can be executed twice. The system therefore provides \textbf{at-least-once} execution combined with \textbf{idempotent} result submission, which means that processing the same result twice does not create duplicate records.
-
-
-\subsubsection{Consistency and the CAP Theorem}
-The CAP theorem states that during a network partition a distributed system must choose between consistency and availability. A central URL registry favors \textbf{consistency}: a worker that cannot reach the coordinator cannot obtain new tasks, so availability is reduced during a partition. This trade-off is discussed in the design chapter.
+The CAP theorem states that during a network partition a distributed system must choose between consistency and availability. The central URL registry in PostgreSQL favors \textbf{consistency}: if the scheduler cannot reach the database, it stops issuing new tasks instead of risking duplicates, so availability is reduced during the failure. This trade-off is discussed in the design chapter.
 
 
 \subsubsection{Scalability Metrics}
-The scalability of the system is evaluated with the following metrics:
+The scalability and the reliability of the system are evaluated with the following metrics:
 \begin{itemize}
     \item total crawling time and throughput (pages per second);
-    \item average response time per page;
-    \item coordinator CPU usage and worker utilization.
+    \item speedup and efficiency compared with the single-machine baseline (1, 2 and 3 workers);
+    \item recovery time after a worker failure and the number of lost or duplicated tasks.
 \end{itemize}
 With $T_1$ the running time on one worker and $T_p$ the running time on $p$ workers, the speedup and the efficiency are
 \[
     S(p) = \frac{T_1}{T_p}, \qquad E(p) = \frac{S(p)}{p}.
 \]
-Amdahl's law bounds the achievable speedup when a fraction $f$ of the work is sequential (here, mainly the coordinator):
+Amdahl's law bounds the achievable speedup when a fraction $f$ of the work is sequential (here, mainly the scheduler and the database):
 \[
     S(p) \le \frac{1}{f + \frac{1-f}{p}}.
 \]
 
+\paragraph{Summary of concepts.} Table~\ref{tab:concepts} relates the problems of the crawler to the concepts of the course.
 
-\subsubsection{Summary: Concepts and Course Topics}
-Table~\ref{tab:concepts} relates the problems of the crawler to the concepts of the course.
- 
 \begin{table}[H]
 \centering
 \begin{tabular}{|p{5.2cm}|p{5.2cm}|p{3.2cm}|}
 \hline
 \textbf{Problem in the crawler} & \textbf{Concept} & \textbf{Course topic} \\
 \hline
-Coordinator and workers exchange messages & Client--server, REST, RPC, message passing & Communication \\
+Scheduler and workers exchange messages & Producer--consumer, message queue (Kafka) & Communication \\
 \hline
-Workers request tasks when free & Dynamic allocation, load balancing & Distributed computing \\
+Many workers share the crawl & Partitions, consumer groups, dynamic allocation, load balancing & Distributed computing \\
 \hline
-Two workers report the same URL & Race condition, atomic operation, mutual exclusion & Transactions, co-ordination \\
+Two workers discover the same URL & Race condition, atomic operation (unique constraint) & Transactions, co-ordination \\
 \hline
-A result is submitted twice & Idempotency, at-least-once execution & Transactions \\
+A task is delivered twice & At-least-once delivery, idempotency & Transactions \\
 \hline
-A worker crashes during a task & Heartbeat, timeout, lease, recovery & Replication, fault tolerance \\
+A worker crashes during a task & Heartbeat, rebalancing, pod restart, retry & Replication, fault tolerance \\
 \hline
-The coordinator crashes & Persistent state, replication, leader election & Co-ordination, consensus \\
+A broker or the scheduler fails & Replicated partitions, persistent state & Replication, consensus \\
 \hline
 Shared visited-URL set & Consistency, CAP theorem & Introduction \\
 \hline
 \end{tabular}
 \caption{Crawler problems and the related distributed-systems concepts.}
+\label{tab:concepts}
 \end{table}
 
 
@@ -157,6 +168,7 @@ Shared visited-URL set & Consistency, CAP theorem & Introduction \\
 
 
 \subsection{Related work or existing systems}
+% Short: e.g. Googlebot/Mercator-style crawlers, Apache Nutch, Scrapy (+ Scrapy-Redis); compare briefly with this design.
 
 
 
@@ -175,11 +187,195 @@ Shared visited-URL set & Consistency, CAP theorem & Introduction \\
 
 
 \subsection{Requirements}
-\subsection{Overall architecture}
-\subsection{Component design}
-\subsection{Communication protocol and API}
-\subsection{Key mechanisms}
+% Functional + non-functional (correctness, distribution, scalability, fault tolerance, performance, reproducibility, documentation).
+The design follows the principle ``build once, deploy anywhere, scale by configuration'': the same container image must run on any machine, and the capacity of the system must be changed by configuration (the number of pods or nodes) and not by changing the code.
+
+\paragraph{Functional requirements.}
+\begin{itemize}
+    \item[\textbf{FR1}] Accept a set of seed URLs and crawl from them within configurable limits (maximum depth and maximum number of pages per domain).
+    \item[\textbf{FR2}] Distribute the URLs to several crawler workers as tasks through Kafka.
+    \item[\textbf{FR3}] For each task, download the page, extract its content and outgoing links, and respect \texttt{robots.txt}.
+    \item[\textbf{FR4}] Store the crawled data and the status of each URL in PostgreSQL.
+    \item[\textbf{FR5}] Send the newly discovered URLs back to the scheduler, which must avoid creating unnecessary duplicate tasks.
+    \item[\textbf{FR6}] Process again the tasks that were not completed when a worker failed.
+\end{itemize}
+
+\paragraph{Non-functional requirements.}
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{3.2cm}|p{10.2cm}|}
+\hline
+\textbf{Criterion} & \textbf{Requirement} \\
+\hline
+Correctness & Crawled data is collected and stored correctly; duplicate URLs are kept to a minimum. \\
+\hline
+Distribution & Several crawler workers process the tasks distributed by Kafka. \\
+\hline
+Scalability & The number of pods and worker nodes can be increased without modifying the application code. \\
+\hline
+Fault tolerance & A failed worker is replaced, and the tasks it did not finish are processed again. \\
+\hline
+Performance & Performance figures of the distributed crawler can be compared with the single-machine baseline under the same conditions. \\
+\hline
+Reproducibility & Another person can set up and run the system with the provided instructions and scripts, using the same library versions and container images. \\
+\hline
+Documentation & Architecture diagram, run instructions, report, and demo video are provided. \\
+\hline
+\end{tabular}
+\caption{Non-functional requirements.}
+\end{table}
+
+
+% ==================================================================
+
+
+\subsection{Architecture and components}
+% Overall flow: Seed URLs -> Scheduler (+ deduplication) -> Kafka (crawl.tasks) -> Crawler workers (Kubernetes pods)
+%   -> fetch/parse/extract -> crawled data to PostgreSQL, new URLs to Kafka (url.discovered) -> Scheduler.
+% Components: Scheduler (frontier, dedup, partitioning), Crawler worker (fetcher, parser, politeness), Storage (PostgreSQL).
+% TODO: confirm with the team which behaviours use Strategy (e.g. politeness policy), or remove this part.
+The system is built from four kinds of nodes, which communicate only through messages and the database: a \textbf{scheduler}, several \textbf{crawler workers}, a \textbf{Kafka} cluster, and a \textbf{PostgreSQL} database. Figure~\ref{fig:architecture} shows the overall architecture.
+
+% NOTE: needs \usepackage{tikz} and \usetikzlibrary{arrows.meta} in the preamble.
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners, minimum height=1.1cm, minimum width=2.6cm, align=center},
+    queue/.style={box, fill=gray!15},
+    arr/.style={-{Stealth[length=2.2mm]}, thick},
+    lbl/.style={font=\scriptsize}
+]
+\node[box]   (seed)  at (0,0)    {Seed URLs};
+\node[box]   (sched) at (3.4,0)  {Scheduler\\{\scriptsize frontier, deduplication}};
+\node[queue] (tasks) at (6.8,0)  {Kafka topic\\\texttt{crawl.tasks}};
+\node[box]   (work)  at (10.2,0) {Crawler workers\\{\scriptsize (Kubernetes pods)}};
+\node[queue] (disc)  at (6.8,-2.4) {Kafka topic\\\texttt{url.discovered}};
+\node[box, minimum width=9.4cm] (db) at (6.8,-4.6) {PostgreSQL (URLs, task status, crawled data)};
+
+\draw[arr] (seed) -- (sched);
+\draw[arr] (sched) -- (tasks);
+\draw[arr] (tasks) -- (work);
+\draw[arr] ([xshift=-0.5cm]work.south) |- (disc.east);
+\draw[arr] (disc.west) -| ([xshift=0.5cm]sched.south);
+\draw[arr, <->] ([xshift=-0.5cm]sched.south) -- ([xshift=-0.5cm]sched.south |- db.north)
+    node[lbl, midway, left] {URL status};
+\draw[arr] ([xshift=0.5cm]work.south) -- ([xshift=0.5cm]work.south |- db.north)
+    node[lbl, midway, right] {crawled data};
+\node[lbl, anchor=south] at (9.0,-2.38) {new URLs};
+\end{tikzpicture}
+\caption{Overall architecture of the distributed crawler.}
+\label{fig:architecture}
+\end{figure}
+
+The data flow of the system is as follows:
+\begin{enumerate}
+    \item The seed URLs are loaded into the scheduler.
+    \item The scheduler normalizes each URL, checks in PostgreSQL whether it is already known, and only publishes the new ones as tasks to the topic \texttt{crawl.tasks}.
+    \item The crawler workers, which run as several Kubernetes pods, consume the tasks from Kafka.
+    \item Each worker downloads the page, parses it, and extracts the content and the outgoing links.
+    \item The crawled data is stored in PostgreSQL, and the new URLs are published to the topic \texttt{url.discovered}.
+    \item The scheduler consumes \texttt{url.discovered} and repeats from step~2, until the depth and page limits are reached.
+\end{enumerate}
+
+\paragraph{Components.} Table~\ref{tab:components} lists the responsibilities of the components and the corresponding modules of the code.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{2.8cm}|p{6.2cm}|p{4.4cm}|}
+\hline
+\textbf{Component} & \textbf{Responsibility} & \textbf{Module} \\
+\hline
+Scheduler & Normalizes URLs, registers new URLs atomically, applies the depth and page limits, and publishes tasks to Kafka & \texttt{scheduler/main.py}, \texttt{frontier.py} \\
+\hline
+Crawler worker & Consumes tasks, checks \texttt{robots.txt} and the request rate, downloads and parses the page, stores the result, and publishes new URLs & \texttt{crawler/main.py}, \texttt{fetcher.py}, \texttt{parser.py}, \texttt{politeness.py} \\
+\hline
+Storage & Database schema and all PostgreSQL operations & \texttt{storage/schema.sql}, \texttt{repository.py} \\
+\hline
+Kafka & Two brokers; the topics \texttt{crawl.tasks} and \texttt{url.discovered} & \texttt{k8s/kafka.yaml} \\
+\hline
+Common code & Configuration, Kafka producer/consumer, URL normalization & \texttt{common/} \\
+\hline
+Seed loader & Inserts the initial URLs & \texttt{scripts/seed.py} \\
+\hline
+Baseline crawler & Single-process crawler that reuses the same fetcher and parser; used for comparison & \texttt{crawler/} \\
+\hline
+\end{tabular}
+\caption{Components of the system and their modules.}
+\label{tab:components}
+\end{table}
+
+\paragraph{Deployment view.} All services run on a Kubernetes cluster of two virtual machines. The scheduler and the crawler workers are Kubernetes Deployments (two to three crawler pods), PostgreSQL runs with a persistent volume, and Kafka runs with two brokers. Adding workers means increasing the number of replicas, or adding a node to the cluster, without changing the Python code.
+
+\paragraph{Design patterns.} The design uses the \textbf{Producer--Consumer} pattern (scheduler and workers through Kafka), the \textbf{Repository} pattern (all database access goes through one module, so the other modules do not contain SQL), and the \textbf{Strategy} pattern for replaceable behaviours.
+
+
+% ==================================================================
+
+
+\subsection{Communication and key mechanisms}
+% Kafka topics and message format; partitioning by domain; deduplication; at-least-once + idempotent storage; retry/logging.
+\paragraph{Topics and messages.} Table~\ref{tab:topics} describes the two Kafka topics.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{2.8cm}|p{3.0cm}|p{4.4cm}|p{2.5cm}|}
+\hline
+\textbf{Topic} & \textbf{Direction} & \textbf{Content} & \textbf{Message key} \\
+\hline
+\texttt{crawl.tasks} & Scheduler $\rightarrow$ workers & URL to crawl, its depth, and its domain & Domain \\
+\hline
+\texttt{url.discovered} & Workers $\rightarrow$ scheduler & Links found on a page, with the depth of that page & -- \\
+\hline
+\end{tabular}
+\caption{Kafka topics used by the system.}
+\label{tab:topics}
+\end{table}
+
+% TODO: the message format has to be agreed by the team (Phase 1). Proposed: JSON, for example
+\begin{verbatim}
+{"url": "https://example.com/a", "depth": 2, "domain": "example.com"}
+\end{verbatim}
+
+\paragraph{URL normalization and deduplication.} Different spellings of the same address (for example upper-case host names, fragments, or trailing slashes) are first converted to one canonical form. The scheduler is the only component that decides whether a URL is new: it registers the canonical URL in PostgreSQL, where the URL has a unique constraint. Registering a URL that already exists is ignored by the database, and only the URLs that were really inserted are published as tasks. Because the check and the insertion form one atomic database operation, two workers that find the same link at the same time cannot create two tasks.
+
+\paragraph{Task status.} Each URL has a status in PostgreSQL, for example \texttt{pending} (registered and sent to Kafka), \texttt{done} (crawled and stored), and \texttt{failed} (all attempts failed). The status makes it possible to find unfinished work and to count the results of the experiments.
+% TODO: confirm the final set of statuses with TV3.
+
+\paragraph{Delivery guarantee and recovery.} A worker commits its position in the topic (the Kafka offset) only after the result is stored in PostgreSQL. If the worker crashes before that, the task is delivered again to another worker after Kafka reassigns the partitions, and Kubernetes starts a new pod. This gives \textbf{at-least-once} delivery. Because the result is stored by URL (an insert or update of the same record), processing a task twice does not create duplicate data. A failed task is retried a limited number of times, and every failure is logged.
+
+\paragraph{Politeness and limits.} A worker reads \texttt{robots.txt} of each domain and waits a minimum time between two requests to the same domain. Since the message key of \texttt{crawl.tasks} is the domain, all URLs of one domain go to the same partition and therefore to the same worker, so each worker can enforce this delay locally without coordination with the others. The scheduler stops publishing URLs whose depth exceeds the maximum depth or whose domain has reached its page limit.
+
+
+% ==================================================================
+
+
 \subsection{Design decisions and trade-offs}
+% Kafka vs. REST coordinator; consistency vs. availability (CAP); partitions vs. number of workers; what is out of scope.
+Table~\ref{tab:decisions} summarizes the main design decisions.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{2.9cm}|p{3.0cm}|p{7.5cm}|}
+\hline
+\textbf{Decision} & \textbf{Alternative} & \textbf{Reason and trade-off} \\
+\hline
+Kafka as task queue & REST coordinator--worker & Kafka decouples the components, buffers tasks, and reassigns partitions automatically when a worker fails; the price is the effort of operating Kafka and an extra network hop. \\
+\hline
+Central deduplication in scheduler and PostgreSQL & Deduplication inside every worker & One place decides, so consistency is simple; but the scheduler and the database can become a bottleneck when workers increase (Amdahl's law). In terms of the CAP theorem the system prefers consistency: if the database is unreachable, no new tasks are created. \\
+\hline
+Partition by domain & Random distribution & Politeness is easy to enforce locally; but the parallelism is limited by the number of partitions and domains, and one very large domain keeps a single worker busy. \\
+\hline
+At-least-once delivery with idempotent storage & Exactly-once processing & Much simpler to implement; a task may be processed twice, but this does not change the stored data. \\
+\hline
+Kubernetes & Processes started manually & Scaling by replicas and automatic restart of failed pods; but setting up the cluster (kubeadm on several VMs) takes effort. \\
+\hline
+\end{tabular}
+\caption{Main design decisions and their trade-offs.}
+\label{tab:decisions}
+\end{table}
+
+\paragraph{Out of scope.} The first version does not include a Dead Letter Queue or a Transactional Outbox, distributed rate limiting across workers, a monitoring dashboard, auto-scaling with KEDA, or a production-grade fault-tolerant Kafka setup. They are mentioned as future work in the conclusion.
 
 
 
@@ -196,12 +392,52 @@ Shared visited-URL set & Consistency, CAP theorem & Introduction \\
 \newpage
 \section{Implementation}
 
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{4.6cm}|p{9.0cm}|}
+\hline
+\textbf{Technology} & \textbf{Role} \\
+\hline
+Python 3.10, \texttt{uv} & Programming language and project/dependency management \\
+\hline
+\texttt{requests}, BeautifulSoup & Download HTML and extract content and links \\
+\hline
+Apache Kafka, \texttt{confluent-kafka} & Message broker that distributes crawl tasks; Python producer/consumer \\
+\hline
+PostgreSQL, \texttt{psycopg} & Stores URLs, task status, and crawled data \\
+\hline
+Docker, containerd & Build container images; container runtime in Kubernetes \\
+\hline
+Kubernetes (kubeadm) on Ubuntu Server 24.04 & Runs and scales the scheduler and the worker pods on several VMs \\
+\hline
+Ansible, Helm & Automated VM setup; packaged application deployment \\
+\hline
+Docker Compose & Local development environment \\
+\hline
+GitHub, GitHub Actions & Version control, pull requests, CI \\
+\hline
+\texttt{pytest}, \texttt{ruff} & Unit/integration tests; linting and formatting \\
+\hline
+\end{tabular}
+\caption{Technology stack of the project.}
+\label{tab:stack}
+\end{table}
 
-\subsection{Technology stack and platform}
-\subsection{Project structure}
-\subsection{Implementation details of the main components}
-\subsection{Challenges}
+% Project structure: src/{common,scheduler,crawler,storage}, k8s/, tests/, scripts/seed.py, .github/workflows/ci.yml, Dockerfile.
 
+
+% ==================================================================
+
+
+\subsection{Implementation of the main components}
+% Scheduler, crawler worker, storage; code snippets only where they explain a mechanism.
+
+
+% ==================================================================
+
+
+\subsection{Deployment and challenges}
+% Kubernetes setup on 2+ VMs, deployment scripts, problems met and how they were solved.
 
 
 
@@ -219,11 +455,28 @@ Shared visited-URL set & Consistency, CAP theorem & Introduction \\
 
 
 \subsection{Experimental setup}
-\subsection{Scalability}
-\subsection{Static vs. dynamic allocation comparison}
-\subsection{Fault tolerance test}
-\subsection{Discussion}
+% Same URL set, same request/domain limits and network conditions for baseline and distributed runs.
 
+
+% ==================================================================
+
+
+\subsection{Scalability and performance}
+% Single crawler vs. distributed crawler with 1, 2, 3 workers: throughput, completion time, speedup, efficiency.
+
+
+% ==================================================================
+
+
+\subsection{Fault tolerance and duplicate handling}
+% Kill a worker/pod: recovery time, no lost tasks; duplicate-URL test.
+
+
+% ==================================================================
+
+
+\subsection{Discussion}
+% Interpretation, bottlenecks (partitions, politeness, scheduler/database), limits of the results.
 
 
 
@@ -241,7 +494,13 @@ Shared visited-URL set & Consistency, CAP theorem & Introduction \\
 
 
 \subsection{Summary against the objectives}
-\subsection{Limitations}
+
+
+% ==================================================================
+
+
+\subsection{Limitations and future work}
+% Future work: retry/DLQ/outbox, distributed rate limiting, dashboard, KEDA auto-scaling.
 
 
 
